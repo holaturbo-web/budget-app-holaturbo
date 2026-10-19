@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Can I Buy It?</title>
+<meta name="description" content="Personal offline budget checker. Data stays on this device.">
+<meta name="theme-color" content="#0f6b55">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Can I Buy It?">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div>
+      <div class="eyebrow" id="weekLabel">Paycheck week</div>
+      <h1 id="screenTitle">Can I Buy It?</h1>
+    </div>
+    <div class="pill" id="offlinePill" hidden>Offline</div>
+  </header>
+
+  <main id="view" aria-live="polite"></main>
+</div>
+
+<nav class="tabs" aria-label="Sections">
+  <button data-tab="spend" class="on"><span class="ti">$</span>Spend</button>
+  <button data-tab="week"><span class="ti">▦</span>Week</button>
+  <button data-tab="money"><span class="ti">⇄</span>Money</button>
+  <button data-tab="goals"><span class="ti">◎</span>Goals</button>
+  <button data-tab="more"><span class="ti">≡</span>More</button>
+</nav>
+
+<div class="sheet-backdrop" id="sheetBackdrop" hidden></div>
+<div class="sheet" id="sheet" role="dialog" aria-modal="true" hidden></div>
+<div class="toast" id="toast" role="status"></div>
+
+<script src="app.js"></script>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+}
+</script>
+</body>
+</html>
