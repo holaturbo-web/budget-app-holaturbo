@@ -44,25 +44,80 @@ const KINDS = { budget: "Budget", work: "Work (paid back)", planned: "Planned / 
 
 /* ---------- State ---------- */
 function blankState() {
-  return { version: 2, settings: clone(EXAMPLE_SETTINGS), tx: [], moves: [], rollovers: {}, leftoverDone: {}, paychecks: [], pending: [], reviews: {}, lastExport: 0, onboarded: false };
+  return { version: 2, settings: clone(EXAMPLE_SETTINGS), tx: [], moves: [], rollovers: {}, leftoverDone: {}, paychecks: [], pending: [], reviews: {}, done: {}, lastExport: 0, onboarded: false };
 }
 function clone(o) { return JSON.parse(JSON.stringify(o)); }
 function migrate(s) {
-  const st = Object.assign(blankState(), s);
+  const st = Object.assign(blankState(), s && typeof s === "object" ? s : {});
+  for (const k of ["tx", "moves", "paychecks", "pending"]) if (!Array.isArray(st[k])) st[k] = [];
+  for (const k of ["rollovers", "leftoverDone", "reviews", "done"]) if (!st[k] || typeof st[k] !== "object" || Array.isArray(st[k])) st[k] = {};
   for (const t of st.tx) if (!t.kind) t.kind = "budget";
-  if (!Array.isArray(st.pending)) st.pending = [];
   st.version = 2;
   return st;
 }
+/* Bad data from a hand-edited or damaged file: keep only purchases with a real number, date and category. */
+function cleanTx(list) {
+  const out = []; let dropped = 0;
+  for (const t of Array.isArray(list) ? list : []) {
+    const amount = Number(t && t.amount), ts = Number(t && t.ts);
+    if (!t || !isFinite(amount) || !isFinite(ts) || ts <= 0 || typeof t.cat !== "string") { dropped++; continue; }
+    out.push({ ...t, id: String(t.id || uid()), amount: r2(amount), ts, note: typeof t.note === "string" ? t.note.slice(0, 200) : "", kind: KINDS[t.kind] ? t.kind : "budget" });
+  }
+  return { tx: out, dropped };
+}
+const PREV_KEY = STORE_KEY + ".prev", DAMAGED_KEY = STORE_KEY + ".damaged", UNDO_KEY = STORE_KEY + ".undo";
+let loadNote = "", lastRaw = null;
 function load() {
-  try { const raw = localStorage.getItem(STORE_KEY); if (raw) return migrate(JSON.parse(raw)); } catch (e) { /* storage blocked or corrupt */ }
+  let raw = null;
+  try { raw = localStorage.getItem(STORE_KEY); } catch (e) { return blankState(); }
+  if (!raw) return blankState();
+  lastRaw = raw;
+  try { return migrate(JSON.parse(raw)); } catch (e) { /* damaged save */ }
+  try { localStorage.setItem(DAMAGED_KEY, raw); } catch (e) {}
+  try {
+    const prev = localStorage.getItem(PREV_KEY);
+    if (prev) { const st = migrate(JSON.parse(prev)); loadNote = "Your last save was damaged, so the app recovered the save before it. Your most recent change may be missing."; return st; }
+  } catch (e) {}
+  loadNote = "Your saved data was damaged and couldn't be read. A copy was kept on this phone. Restore your latest backup from More.";
   return blankState();
 }
 let S = load();
 let storageOk = true;
+/* If another copy of the app (another tab) saved since we loaded, fold its changes in instead of overwriting them. */
+function mergeFrom(raw) {
+  let o; try { o = migrate(JSON.parse(raw)); } catch (e) { return; }
+  const done = Object.assign({}, o.done, S.done);
+  const mine = new Map(S.tx.map(t => [t.id, t]));
+  for (const t of o.tx) if (!mine.has(t.id) && !done[t.id]) { S.tx.push(t); goalEffect(t, 1); delete t.late; lateApplyTo(t); }
+  for (const t of [...S.tx]) if (o.done[t.id] && !S.done[t.id]) { goalEffect(t, -1); S.tx = S.tx.filter(x => x.id !== t.id); }
+  const myP = new Set(S.pending.map(p => p.id));
+  for (const p of o.pending) if (!myP.has(p.id) && !done[p.id]) S.pending.push(p);
+  for (const p of [...S.pending]) if (o.done[p.id] && !S.done[p.id]) {
+    if (o.done[p.id] === "confirmed") { const g = S.settings.goals.find(g => g.name === p.goal); if (g) g.saved = r2((+g.saved || 0) + p.amount); }
+    S.pending = S.pending.filter(x => x.id !== p.id);
+  }
+  const mk = m => `${m.ts}|${m.from}|${m.to}|${m.amount}`, myM = new Set(S.moves.map(mk));
+  for (const m of o.moves) if (!myM.has(mk(m))) S.moves.push(m);
+  const pk = p => JSON.stringify(p), myPc = new Set(S.paychecks.map(pk));
+  for (const p of o.paychecks) if (!myPc.has(pk(p))) S.paychecks.push(p);
+  for (const k of ["rollovers", "leftoverDone", "reviews"]) for (const key of Object.keys(o[k])) if (!(key in S[k])) S[k][key] = o[k][key];
+  S.lastExport = Math.max(S.lastExport || 0, o.lastExport || 0);
+  S.done = done;
+}
 function save() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); storageOk = true; }
-  catch (e) { storageOk = false; toast("Couldn't save on this device. Export a backup now."); }
+  try {
+    let cur = null; try { cur = localStorage.getItem(STORE_KEY); } catch (e) {}
+    if (cur && lastRaw !== null && cur !== lastRaw) mergeFrom(cur);
+    const raw = JSON.stringify(S);
+    if (cur && cur !== raw) { try { localStorage.setItem(PREV_KEY, cur); } catch (e) { /* no room for the safety copy; the main save still matters more */ } }
+    localStorage.setItem(STORE_KEY, raw); lastRaw = raw; storageOk = true;
+  } catch (e) { storageOk = false; toast("Couldn't save on this device. Export a backup now."); }
+}
+/* Pick up changes another copy of the app saved (called when the app comes back to the front). */
+function reloadIfChanged() {
+  let cur = null; try { cur = localStorage.getItem(STORE_KEY); } catch (e) { return false; }
+  if (!cur || cur === lastRaw) return false;
+  try { S = migrate(JSON.parse(cur)); lastRaw = cur; return true; } catch (e) { return false; }
 }
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
@@ -80,13 +135,21 @@ const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); r
 const fmtDate = (d, o = { month: "short", day: "numeric" }) => d.toLocaleDateString("en-US", o);
 function daysLeftInWeek() { const end = addDays(weekStart(), 7); return Math.max(1, Math.ceil((end - new Date()) / DAY)); }
 /* Timestamp for a chosen day: now if it's today, otherwise noon of that day. */
-function tsFor(dayIso) { const today = isoDay(new Date()); return !dayIso || dayIso === today ? Date.now() : fromIso(dayIso).getTime() + 12 * 3600000; }
+function tsFor(dayIso) { const today = isoDay(new Date()); return !dayIso || dayIso >= today || !/^\d{4}-\d\d-\d\d$/.test(dayIso) ? Date.now() : fromIso(dayIso).getTime() + 12 * 3600000; }
 
 /* ---------- Money ---------- */
 const r2 = n => Math.round(n * 100) / 100;
 const money = n => (n < 0 ? "-" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const money0 = n => (n < 0 ? "-" : "") + "$" + Math.abs(Math.round(n)).toLocaleString("en-US");
-const parseAmt = v => { const n = parseFloat(String(v || "").replace(/[^0-9.]/g, "")); return isFinite(n) && n > 0 ? r2(n) : 0; };
+const MAX_AMT = 100000;
+/* Strict: "12", "12.5", "1,234.56", "$40" are fine. "1.2.3", "12..5", "1e5", "-50", letters are rejected (returns NaN). */
+function parseNum(v) {
+  const s = String(v ?? "").trim().replace(/^\$/, "").replace(/,(?=\d{3}(\D|$))/g, "").replace(/\s/g, "");
+  if (!/^\d*\.?\d*$/.test(s) || !/\d/.test(s)) return NaN;
+  return parseFloat(s);
+}
+/* A purchase or paycheck amount: more than $0, at most 2 decimals, at most $100,000. Returns 0 if not valid. */
+const parseAmt = v => { const s = String(v ?? "").trim(); const n = parseNum(s); return isFinite(n) && n > 0 && n <= MAX_AMT && !/\.\d{3,}/.test(s) ? r2(n) : 0; };
 
 /* ---------- Budget math ---------- */
 function allCats() { return [...S.settings.weekly.map(c => ({ ...c, period: "week" })), ...S.settings.monthly.map(c => ({ ...c, period: "month" }))]; }
@@ -122,26 +185,61 @@ function goalEffect(t, sign) {
   if (!t || t.kind !== "planned" || !t.goal) return;
   const g = S.settings.goals.find(g => g.name === t.goal); if (g) g.saved = r2((+g.saved || 0) - sign * t.amount);
 }
+/* A purchase dated into a past week whose leftover was already rolled over or sent to a goal:
+   take it back out of that rollover (or the waiting goal move) so the money isn't counted twice. */
+let adjNote = "";
+function lateApplyTo(t) {
+  if (!t || t.kind !== "budget" || !(t.amount > 0)) return;
+  const c = catById(t.cat); if (!c || c.period !== "week") return;
+  const ws = weekStart(new Date(t.ts)); if (ws.getTime() >= weekStart().getTime()) return;
+  const key = isoDay(ws), how = S.leftoverDone[key];
+  if (how === "roll") {
+    const nk = isoDay(addDays(ws, 7)), ro = S.rollovers[nk] || {};
+    let need = t.amount;
+    for (const id of [t.cat, ...Object.keys(ro).filter(i => i !== t.cat)]) {
+      const have = ro[id] || 0; if (have <= 0 || need <= 0) continue;
+      const take = r2(Math.min(have, need)); ro[id] = r2(have - take); need = r2(need - take);
+      (t.late = t.late || { how: "roll", week: nk, from: {} }).from[id] = r2((t.late.from[id] || 0) + take);
+    }
+    const took = r2(t.amount - need);
+    if (took > 0) adjNote = `Last week's leftover was already rolled over, so ${money(took)} came back out of this week.`;
+  } else if (how === "goal") {
+    const p = S.pending.find(x => x.week === key);
+    if (p) { const take = r2(Math.min(p.amount, t.amount)); p.amount = r2(p.amount - take); t.late = { how: "goal", pending: p.id, amount: take };
+      adjNote = `Last week's leftover move to ${p.goal} went down by ${money(take)}.`;
+      if (p.amount <= 0) { S.pending = S.pending.filter(x => x !== p); S.done[p.id] = "dismissed"; } }
+    else adjNote = `Heads up: last week's leftover was already moved to a goal. This purchase means ${money(t.amount)} less was really left.`;
+  }
+}
+function lateRevert(t) {
+  if (!t || !t.late) return;
+  if (t.late.how === "roll") { const ro = S.rollovers[t.late.week] = S.rollovers[t.late.week] || {}; for (const [id, a] of Object.entries(t.late.from)) ro[id] = r2((ro[id] || 0) + a); }
+  else { const p = S.pending.find(x => x.id === t.late.pending); if (p) p.amount = r2(p.amount + t.late.amount); }
+  delete t.late;
+}
 function addTx({ amount, cat, note = "", day, kind = "budget", refund = false, goal = "" }) {
+  adjNote = "";
   const t = { id: uid(), ts: tsFor(day), amount: refund ? -Math.abs(amount) : Math.abs(amount), cat, note, kind };
   if (kind === "work") t.reimbursed = false;
   if (kind === "planned" && goal) t.goal = goal;
-  S.tx.push(t); goalEffect(t, 1); save(); return t;
+  S.tx.push(t); goalEffect(t, 1); lateApplyTo(t); save(); return t;
 }
 function updateTx(id, fields) {
+  adjNote = "";
   const t = S.tx.find(x => x.id === id); if (!t) return;
-  goalEffect(t, -1); Object.assign(t, fields);
+  goalEffect(t, -1); lateRevert(t); Object.assign(t, fields);
   if (t.kind !== "planned") delete t.goal;
   if (t.kind === "work" && t.reimbursed == null) t.reimbursed = false;
-  goalEffect(t, 1); save();
+  goalEffect(t, 1); lateApplyTo(t); save();
 }
-function deleteTx(id) { goalEffect(S.tx.find(x => x.id === id), -1); S.tx = S.tx.filter(x => x.id !== id); save(); }
+function deleteTx(id) { const t = S.tx.find(x => x.id === id); goalEffect(t, -1); lateRevert(t); S.tx = S.tx.filter(x => x.id !== id); S.done[id] = "deleted"; save(); }
 /* Everything logged with a date in the current week, all types, refunds subtracted. */
 function loggedThisWeek() { const a = weekStart().getTime(), b = addDays(weekStart(), 7).getTime(); return r2(S.tx.filter(t => t.ts >= a && t.ts < b).reduce((s, t) => s + t.amount, 0)); }
 const giftGoal = () => (S.settings.goals.find(g => /gift/i.test(g.name)) || {}).name || "";
 function coverMove(fromId, toId, amount, d = new Date()) {
-  const c = catById(toId); if (!c || amount <= 0) return;
-  S.moves.push({ period: periodKey(c, d), from: fromId, to: toId, amount: r2(amount), ts: Date.now() }); save();
+  const c = catById(toId), f = catById(fromId); if (!c || !f || fromId === toId) return 0;
+  amount = r2(Math.min(amount, left(f, d))); if (!(amount > 0)) return 0;
+  S.moves.push({ period: periodKey(c, d), from: fromId, to: toId, amount, ts: Date.now() }); save(); return amount;
 }
 /* Money that could cover `need` in category c, from categories in the same period with money left. */
 function coverOptions(c, need, d = new Date()) {
@@ -164,7 +262,7 @@ function resolveLeftover(choice, goalName) {
     const f = r.net / r.pos;
     for (const [id, l] of Object.entries(r.per)) if (l > 0) S.rollovers[k][id] = r2((S.rollovers[k][id] || 0) + l * f);
   } else if (choice === "goal" && r.net > 0) {
-    S.pending.push({ id: uid(), goal: goalName, amount: r.net, note: `Leftover from week of ${fmtDate(r.prev)}`, created: Date.now() });
+    S.pending.push({ id: uid(), goal: goalName, amount: r.net, note: `Leftover from week of ${fmtDate(r.prev)}`, created: Date.now(), week: r.key });
   }
   S.leftoverDone[r.key] = r.net > 0 ? choice : "over"; save();
 }
@@ -177,9 +275,9 @@ function recordPaycheck(net) {
 function confirmPending(id) {
   const p = S.pending.find(x => x.id === id); if (!p) return;
   const g = S.settings.goals.find(g => g.name === p.goal); if (g) g.saved = r2((+g.saved || 0) + p.amount);
-  S.pending = S.pending.filter(x => x.id !== id); save();
+  S.pending = S.pending.filter(x => x.id !== id); S.done[id] = "confirmed"; save();
 }
-function dismissPending(id) { S.pending = S.pending.filter(x => x.id !== id); save(); }
+function dismissPending(id) { S.pending = S.pending.filter(x => x.id !== id); S.done[id] = "dismissed"; save(); }
 function markReimbursed(id) { updateTx(id, { reimbursed: true }); }
 function pastWeeks(n = 8) {
   const out = []; let ws = addDays(weekStart(), -7);
@@ -201,8 +299,8 @@ const el = (tag, attrs = {}, ...kids) => {
   return e;
 };
 let toastT;
-function toast(msg) { const t = $("#toast"); if (!t) return; t.textContent = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 2800); }
-function openSheet(node) { const sh = $("#sheet"); sh.innerHTML = ""; sh.append(node); sh.hidden = false; $("#sheetBackdrop").hidden = false; }
+function toast(msg) { const t = $("#toast"); if (!t) return; t.textContent = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), Math.max(2800, msg.length * 55)); }
+function openSheet(node) { const tt = $("#toast"); if (tt) tt.classList.remove("show"); const sh = $("#sheet"); sh.innerHTML = ""; sh.append(node); sh.hidden = false; $("#sheetBackdrop").hidden = false; }
 function closeSheet() { $("#sheet").hidden = true; $("#sheetBackdrop").hidden = true; }
 function bar(pct, state) { const i = el("i"); i.style.width = Math.max(0, Math.min(100, pct)) + "%"; if (state) i.className = state; return el("div", { class: "bar" }, i); }
 function segmented(options, value, onChange, label) {
@@ -220,6 +318,7 @@ function render() {
   const ws = weekStart(), we = addDays(ws, 6);
   $("#weekLabel").textContent = `Paycheck week · ${fmtDate(ws)} – ${fmtDate(we)}`;
   const v = $("#view"); v.innerHTML = "";
+  if (loadNote) v.append(el("div", { class: "banner row" }, el("span", {}, loadNote), el("button", { class: "btn sm", onclick: () => { loadNote = ""; render(); } }, "OK")));
   if (!S.onboarded) { v.append(onboarding()); return; }
   if (S.settings.isExample) v.append(el("div", { class: "banner" }, "You're using example numbers. Go to More → Import settings to load your own budget."));
   if (!storageOk) v.append(el("div", { class: "banner" }, "This device isn't saving data. Export a backup from More."));
@@ -230,7 +329,7 @@ function render() {
 
 /* ---------- Onboarding ---------- */
 function onboarding() {
-  const file = el("input", { type: "file", accept: "application/json,.json", hidden: true, onchange: e => importFile(e.target.files[0]) });
+  const file = el("input", { type: "file", accept: "application/json,.json", hidden: true, onchange: e => { importFile(e.target.files[0]); e.target.value = ""; } });
   return el("div", { class: "card stack" },
     el("h2", {}, "Welcome"),
     el("p", { class: "muted", style: "margin:0" }, "This app keeps your budget on this phone only. It works offline and never connects to your bank."),
@@ -280,17 +379,21 @@ function viewSpend(v) {
     el("div", {}, el("div", { class: "k" }, `Safe per day · ${days} day${days > 1 ? "s" : ""} left`), el("div", { class: "v" + (perDay < 0 ? " bad" : "") }, money(Math.max(perDay, 0))))));
 
   const today = isoDay(new Date()), yest = isoDay(addDays(new Date(), -1));
-  if (!draft.day) draft.day = today;
+  // A date you picked is kept for 15 minutes; otherwise it's always today (so leaving the app open overnight can't log to yesterday).
+  if (!draft.day || (draft.day !== today && !(draft.dayAt && Date.now() - draft.dayAt < 15 * 60000))) { draft.day = today; draft.dayAt = 0; }
   const amt = el("input", { class: "amt", inputmode: "decimal", autocomplete: "off", placeholder: "0.00", "aria-label": "Amount in dollars", id: "amt" });
   const note = el("input", { class: "input", placeholder: "What is it? (optional)", maxlength: "80", autocomplete: "off", id: "note" });
   const verdict = el("div", { class: "verdict v-idle" });
+  const amtErr = el("p", { class: "small bad-text", style: "margin:0", role: "alert" });
   const coverBox = el("div", { class: "stack" });
   const logBtn = el("button", { class: "btn", disabled: true, id: "logBtn" }, "Log it as spent");
   const chips = el("div", { class: "chips", role: "group", "aria-label": "Category" });
   const dateIn = el("input", { type: "date", class: "input sm", value: draft.day, max: today, id: "day", "aria-label": "Date" });
   const dayChips = el("div", { class: "chips" });
-  const drawDays = () => { dayChips.innerHTML = ""; for (const [k, txt] of [[today, "Today"], [yest, "Yesterday"]]) dayChips.append(el("button", { class: "chip sm", type: "button", "aria-pressed": draft.day === k ? "true" : "false", onclick: () => { draft.day = k; dateIn.value = k; drawDays(); judge(); } }, txt)); dayChips.append(dateIn); };
-  dateIn.addEventListener("change", () => { draft.day = dateIn.value || today; drawDays(); judge(); });
+  const drawDays = () => { dayChips.innerHTML = ""; for (const [k, txt] of [[today, "Today"], [yest, "Yesterday"]]) dayChips.append(el("button", { class: "chip sm", type: "button", "aria-pressed": draft.day === k ? "true" : "false", onclick: () => { draft.day = k; draft.dayAt = Date.now(); dateIn.value = k; drawDays(); judge(); } }, txt)); dayChips.append(dateIn); };
+  dateIn.addEventListener("change", () => {
+    if (dateIn.value > today) { toast("You can't log a purchase in the future. Using today."); dateIn.value = today; }
+    draft.day = dateIn.value || today; draft.dayAt = Date.now(); drawDays(); judge(); });
   const refundChk = el("input", { type: "checkbox", id: "refund", checked: draft.refund });
   refundChk.addEventListener("change", () => { draft.refund = refundChk.checked; judge(); });
   const goalSel = el("select", { class: "input", id: "pgoal", "aria-label": "Paid from goal" },
@@ -311,11 +414,13 @@ function viewSpend(v) {
   }
   function judge() {
     const a = parseAmt(amt.value), c = draft.cat && catById(draft.cat), d = fromIso(draft.day || today);
-    logBtn.disabled = !(a && c); coverBox.innerHTML = "";
+    logBtn.disabled = !(a && c); coverBox.innerHTML = ""; delete logBtn.dataset.sure;
     const now = new Date(), isWeekStartDay = now.getDay() === S.settings.weekStartDay, isNextMorning = now.getDay() === (S.settings.weekStartDay + 1) % 7 && now.getHours() < 12;
     lateHint.textContent = draft.day === today && (isWeekStartDay || isNextMorning) ? "A new week started Friday. If you bought this before then, open Date and pick the day so it counts in last week." : "";
     logBtn.textContent = draft.refund ? "Log refund" : "Log it as spent";
     const set = (cls, head, msg) => { verdict.className = "verdict " + cls; verdict.replaceChildren(el("span", { class: "dot" }), el("div", {}, el("b", {}, head), el("p", {}, msg))); };
+    amtErr.textContent = !a && amt.value.trim() ? `Not a valid amount. Use numbers like 12.50 or 1,250 (up to ${money0(MAX_AMT)}).` : "";
+    if (!a && amt.value.trim()) return set("v-bad", "That doesn't look like an amount", `Use numbers like 12.50 or 1,250 (up to ${money0(MAX_AMT)}).`);
     if (!a || !c) return set("v-idle", !a ? "Enter an amount" : "Pick a category", !a ? "Type what it costs." : "Tap where this money comes from.");
     const per = c.period === "week" ? (isoDay(weekStart(d)) === isoDay(weekStart()) ? "this week" : "that week") : "this month", nm = c.name.toLowerCase();
     if (draft.kind === "work") return set("v-ok", "Doesn't count against your week", "Logged as a work purchase. It goes on your Owed to me list until you're paid back.");
@@ -325,7 +430,9 @@ function viewSpend(v) {
       const after = r2((+g.saved || 0) - (draft.refund ? -a : a));
       return set(after < 0 ? "v-warn" : "v-ok", draft.refund ? `Refund back to ${g.name}` : `Paid from ${g.name}`, after < 0 ? `That's ${money(-after)} more than ${g.name} has. It will show as negative.` : `${g.name} goes from ${money(+g.saved || 0)} to ${money(after)}. Doesn't count against your week.`);
     }
-    if (draft.refund) return set("v-ok", "Refund", `Adds ${money(a)} back to ${nm} ${per}.`);
+    if (draft.refund) { const sp = spent(c, d);
+      return a > sp ? set("v-warn", "That's more than you spent here", `You've only spent ${money(Math.max(sp, 0))} on ${nm} ${per}. A refund should only give back what you paid. Check the category or the date.`)
+        : set("v-ok", "Refund", `Adds ${money(a)} back to ${nm} ${per}.`); }
     const lf = left(c, d), after = r2(lf - a), lim = effLimit(c, d), used = lim > 0 ? (lim - after) / lim : 1;
     if (after < 0) {
       set("v-bad", "No, it doesn't fit", `That's ${money(-after)} over. You have ${money(Math.max(lf, 0))} left for ${nm} ${per}.`);
@@ -341,9 +448,10 @@ function viewSpend(v) {
   amt.addEventListener("input", judge);
   logBtn.addEventListener("click", () => {
     const a = parseAmt(amt.value); if (!a || !draft.cat) return;
+    if (a >= 1000 && !logBtn.dataset.sure) { logBtn.dataset.sure = "1"; logBtn.textContent = `Tap again to log ${money(a)}`; return; }
     addTx({ amount: a, cat: draft.cat, note: note.value.trim(), day: draft.day, kind: draft.kind, refund: draft.refund, goal: draft.kind === "planned" ? draft.goal : "" });
-    toast(`${draft.refund ? "Refund" : "Logged"} ${money(a)} · ${catById(draft.cat).name}${draft.kind === "planned" && draft.goal ? " · from " + draft.goal : ""}`);
-    draft = { cat: null, day: today, kind: "budget", refund: false, goal: "" }; render();
+    toast(`${draft.refund ? "Refund" : "Logged"} ${money(a)} · ${catById(draft.cat).name}${draft.kind === "planned" && draft.goal ? " · from " + draft.goal : ""}${adjNote ? ". " + adjNote : ""}`);
+    draft = { cat: null, day: null, kind: "budget", refund: false, goal: "" }; render();
   });
 
   const favs = S.settings.favorites || [];
@@ -360,7 +468,7 @@ function viewSpend(v) {
 
   v.append(el("section", { class: "card stack", "aria-label": "Check a purchase" },
     el("label", { for: "amt", class: "eyebrow" }, "How much?"),
-    el("div", { class: "amtrow" }, el("span", {}, "$"), amt),
+    el("div", { class: "amtrow" }, el("span", {}, "$"), amt), amtErr,
     chips, favWrap ? el("div", { class: "eyebrow" }, "Favorites") : null, favWrap, note, more, lateHint, verdict, coverBox, logBtn));
   drawChips(); drawDays(); judge();
 
@@ -400,10 +508,11 @@ function editTx(id) {
     el("div", { class: "field" }, el("label", { for: "egoal" }, "Paid from goal (Planned type only)"), egoal),
     el("label", { class: "row small", for: "erefund", style: "justify-content:flex-start" }, refund, "Refund or return"),
     el("button", { class: "btn", onclick: () => {
-      const a = parseAmt(amt.value); if (!a) { toast("Enter an amount"); return; }
+      const a = parseAmt(amt.value); if (!a) { toast("Enter a valid amount, like 12.50"); return; }
+      if (day.value > isoDay(new Date())) { toast("You can't move a purchase into the future."); return; }
       const sameDay = day.value === isoDay(new Date(t.ts));
       updateTx(id, { amount: refund.checked ? -a : a, cat: cat.value, note: note.value.trim(), kind, goal: kind === "planned" ? egoal.value : undefined, ts: sameDay ? t.ts : tsFor(day.value) });
-      closeSheet(); toast("Saved"); render();
+      closeSheet(); toast("Saved" + (adjNote ? ". " + adjNote : "")); render();
     } }, "Save"),
     del, el("button", { class: "btn ghost", onclick: closeSheet }, "Cancel")));
 }
@@ -539,7 +648,11 @@ function editGoal(i) {
   openSheet(el("div", { class: "stack" }, el("h2", {}, g.name),
     el("div", { class: "grid2" }, el("div", { class: "field" }, el("label", { for: "gsaved" }, "Saved so far"), saved), el("div", { class: "field" }, el("label", { for: "gtarget" }, "Target"), target)),
     el("p", { class: "muted small", style: "margin:0" }, "Tip: match this to your SoFi Vault balance."),
-    el("button", { class: "btn", onclick: () => { g.saved = parseFloat(saved.value) || 0; g.target = parseFloat(target.value) || g.target; save(); closeSheet(); render(); } }, "Save"),
+    el("button", { class: "btn", onclick: () => {
+      const sv = parseNum(saved.value), tg = parseNum(target.value);
+      if (!isFinite(sv)) { toast("Saved so far needs a number, like 9,348.75"); return; }
+      if (!isFinite(tg) || tg <= 0) { toast("Target needs a number above 0, like 11,000"); return; }
+      g.saved = r2(sv); g.target = r2(tg); save(); closeSheet(); render(); } }, "Save"),
     el("button", { class: "btn ghost", onclick: closeSheet }, "Cancel")));
 }
 
@@ -563,12 +676,13 @@ function viewMore(v) {
     notes,
     el("button", { class: "btn ghost", onclick: () => { S.reviews[key] = { note: notes.value.trim(), at: Date.now() }; save(); toast("Review saved"); } }, S.reviews[key] ? "Update review" : "Mark week reviewed")));
 
-  const file = el("input", { type: "file", accept: "application/json,.json", hidden: true, onchange: e => importFile(e.target.files[0]) });
+  const file = el("input", { type: "file", accept: "application/json,.json", hidden: true, onchange: e => { importFile(e.target.files[0]); e.target.value = ""; } });
   v.append(el("section", { class: "card stack" }, el("h2", {}, "Backup & share with Claude"),
     el("p", { class: "muted small", style: "margin:0" }, (S.lastExport ? `Last backup: ${fmtDate(new Date(S.lastExport), { month: "short", day: "numeric" })}. ` : "") + "Your data only lives on this phone. Export a backup every week and send it at your check-in."),
     el("button", { class: "btn", onclick: exportBackup }, "Export backup (.json)"),
     el("button", { class: "btn ghost", onclick: exportCSV }, "Export purchases (.csv)"),
-    file, el("button", { class: "btn ghost", onclick: () => file.click() }, "Import settings or restore backup")));
+    file, el("button", { class: "btn ghost", onclick: () => file.click() }, "Import settings or restore backup"),
+    undoInfo() ? el("button", { class: "btn ghost", onclick: undoImport }, `Undo last ${undoInfo()}`) : null));
 
   v.append(settingsCard());
 
@@ -578,9 +692,10 @@ function viewMore(v) {
     armed = true; reset.textContent = "Tap again to erase everything"; setTimeout(() => { armed = false; reset.textContent = "Erase all data on this phone"; }, 4000);
   } }, "Erase all data on this phone");
   v.append(el("section", { class: "card stack" }, el("h2", {}, "Reset"), reset));
-  v.append(el("p", { class: "muted small", style: "text-align:center" }, "Works offline · no account · no bank connection · v3"));
+  v.append(el("p", { class: "muted small", style: "text-align:center" }, "Works offline · no account · no bank connection · v4"));
 }
 
+function undoInfo() { try { const u = JSON.parse(localStorage.getItem(UNDO_KEY) || "null"); return u && Date.now() - u.at < 14 * DAY ? `${u.label} (${fmtDate(new Date(u.at))})` : ""; } catch (e) { return ""; } }
 /* "Forgot anything?" — compare what the card apps show with what was logged. */
 function forgotCheck() {
   const inp = el("input", { class: "input num", inputmode: "decimal", placeholder: "Card charges since Friday, e.g. 312.40", id: "cardtot" });
@@ -618,9 +733,13 @@ function settingsCard() {
     sg.append(el("div", { class: "field" }, el("label", { for: `spl-${i}` }, x.goal), inp)); });
   wrap.append(sg);
   wrap.append(el("button", { class: "btn", onclick: () => {
-    s.checkingPerCheck = parseFloat(chk.value) || s.checkingPerCheck;
-    for (const [grp, i, inp] of limInputs) { const n = parseFloat(inp.value); if (isFinite(n) && n >= 0) s[grp][i].limit = n; }
-    s.splits.forEach((x, i) => { const n = parseFloat(spl[i].value); if (isFinite(n) && n >= 0) x.pct = n; });
+    const ck = parseNum(chk.value); if (!isFinite(ck)) { toast("Checking per paycheck needs a number (0 is OK)."); return; }
+    const lims = []; for (const [grp, i, inp] of limInputs) { const n = parseNum(inp.value); if (!isFinite(n)) { toast(`${s[grp][i].name} limit needs a number (0 is OK).`); return; } lims.push([grp, i, r2(n)]); }
+    const pcts = s.splits.map((x, i) => parseNum(spl[i].value));
+    if (pcts.some(n => !isFinite(n))) { toast("Each paycheck split needs a number."); return; }
+    const tot = r2(pcts.reduce((a, n) => a + n, 0));
+    if (Math.abs(tot - 100) > 0.01) { toast(`Your splits add up to ${tot}%. They need to add up to exactly 100%. Nothing was saved.`); return; }
+    s.checkingPerCheck = r2(ck); for (const [grp, i, n] of lims) s[grp][i].limit = n; s.splits.forEach((x, i) => { x.pct = pcts[i]; });
     s.isExample = false; save(); toast("Settings saved"); render();
   } }, "Save settings"));
   wrap.append(el("p", { class: "muted small", style: "margin:0" }, "To change categories, bills, goals, gifts or favorites, ask Claude for an updated settings file and import it. Your purchases stay."));
@@ -636,24 +755,117 @@ function download(name, text, type) {
 function exportBackup() { S.lastExport = Date.now(); save(); download(`budget-backup-${isoDay(new Date())}.json`, JSON.stringify({ type: "cibi-backup", version: 2, exported: new Date().toISOString(), state: S }, null, 1), "application/json"); render(); }
 function exportCSV() {
   const lines = [["date", "amount", "category", "type", "note"].join(",")];
-  for (const t of [...S.tx].sort((a, b) => a.ts - b.ts)) lines.push([isoDay(new Date(t.ts)), t.amount.toFixed(2), JSON.stringify((catById(t.cat) || { name: t.cat }).name), t.kind, JSON.stringify(t.note || "")].join(","));
+  for (const t of [...S.tx].sort((a, b) => a.ts - b.ts)) lines.push([isoDay(new Date(t.ts)), (Number(t.amount) || 0).toFixed(2), JSON.stringify((catById(t.cat) || { name: t.cat }).name), t.kind, JSON.stringify(t.note || "")].join(","));
   download(`budget-purchases-${isoDay(new Date())}.csv`, lines.join("\n"), "text/csv");
+}
+/* Returns a list of problems; empty means the settings are safe to use. */
+function checkSettings(st) {
+  const errs = [], num = x => typeof x === "number" && isFinite(x);
+  if (!st || typeof st !== "object") return ["There are no settings in this file."];
+  const ids = new Set();
+  for (const [grp, label] of [["weekly", "Weekly"], ["monthly", "Monthly"]]) {
+    if (!Array.isArray(st[grp]) || !st[grp].length) { errs.push(`${label} categories are missing.`); continue; }
+    for (const c of st[grp]) {
+      if (!c || typeof c.id !== "string" || !c.id || typeof c.name !== "string") { errs.push(`A ${label.toLowerCase()} category is missing its id or name.`); continue; }
+      if (!num(c.limit) || c.limit < 0 || c.limit > MAX_AMT) errs.push(`${c.name} has a bad limit (${c.limit}).`);
+      if (ids.has(c.id)) errs.push(`Two categories use the same id "${c.id}".`); ids.add(c.id);
+    }
+  }
+  for (const k of ["bills", "goals", "gifts", "favorites", "splits"]) if (!Array.isArray(st[k])) errs.push(`"${k}" should be a list.`);
+  if (errs.length) return errs;
+  const names = new Set();
+  for (const g of st.goals) {
+    if (!g || typeof g.name !== "string" || !g.name) { errs.push("A goal is missing its name."); continue; }
+    if (names.has(g.name)) errs.push(`Two goals are both named "${g.name}".`); names.add(g.name);
+    if (!num(+g.saved) || !num(+g.target) || +g.target <= 0) errs.push(`Goal "${g.name}" has a bad saved or target amount.`);
+  }
+  let tot = 0;
+  for (const x of st.splits) {
+    if (!x || !num(x.pct) || x.pct < 0) { errs.push("A paycheck split has a bad percent."); continue; }
+    if (!names.has(x.goal)) errs.push(`The split for "${x.goal}" doesn't match any goal.`);
+    tot += x.pct;
+  }
+  if (st.splits.length && Math.abs(tot - 100) > 0.01) errs.push(`Paycheck splits add up to ${r2(tot)}%, not 100%.`);
+  for (const b of st.bills) if (!b || !num(+b.amount) || !(+b.day >= 1 && +b.day <= 31)) errs.push(`Bill "${(b && b.name) || "?"}" has a bad amount or day.`);
+  if (!(Number.isInteger(st.weekStartDay) && st.weekStartDay >= 0 && st.weekStartDay <= 6)) errs.push("The week start day must be 0–6.");
+  if (!num(st.checkingPerCheck) || st.checkingPerCheck < 0) errs.push("The checking amount per paycheck is bad.");
+  return errs;
+}
+function rejectFile(errs) {
+  openSheet(el("div", { class: "stack" }, el("h2", {}, "This file wasn't imported"),
+    el("p", { class: "muted small", style: "margin:0" }, "Nothing on this phone was changed. Problems found:"),
+    el("div", { class: "small" }, errs.slice(0, 8).map(e => el("div", {}, "• " + e))),
+    el("button", { class: "btn", onclick: closeSheet }, "OK")));
+}
+const latestDay = list => list.length ? fmtDate(new Date(Math.max(...list.map(t => t.ts))), { month: "short", day: "numeric", year: "numeric" }) : "none";
+function keepUndo(label) { try { localStorage.setItem(UNDO_KEY, JSON.stringify({ at: Date.now(), label, state: S })); } catch (e) {} }
+function undoImport() {
+  try { const u = JSON.parse(localStorage.getItem(UNDO_KEY)); S = migrate(u.state); localStorage.removeItem(UNDO_KEY); save(); toast("Undone. Your data is back the way it was."); }
+  catch (e) { toast("Nothing to undo."); }
+  tab = "spend"; render();
+}
+function applyBackup(st) {
+  if (S.onboarded && (S.tx.length || !S.settings.isExample)) keepUndo("backup restore");
+  S = st; S.onboarded = true; save(); toast("Backup restored. You can undo this in More."); tab = "spend"; render();
+}
+function restoreBackup(j) {
+  const st = migrate(j.state);
+  const errs = checkSettings(Object.assign(clone(EXAMPLE_SETTINGS), st.settings));
+  if (errs.length) return rejectFile(errs);
+  st.settings = Object.assign(clone(EXAMPLE_SETTINGS), st.settings, { isExample: st.settings && st.settings.isExample === true });
+  const { tx, dropped } = cleanTx(st.tx); st.tx = tx;
+  if (!S.onboarded || (!S.tx.length && S.settings.isExample)) return applyBackup(st);
+  const mineNewer = S.tx.length && (!tx.length || Math.max(...S.tx.map(t => t.ts)) > Math.max(...tx.map(t => t.ts)));
+  const lost = S.tx.filter(t => !tx.some(b => b.id === t.id)).length;
+  openSheet(el("div", { class: "stack" }, el("h2", {}, "Replace everything with this backup?"),
+    el("div", { class: "small" },
+      el("div", {}, `• Backup: ${tx.length} purchases, latest ${latestDay(tx)}`),
+      el("div", {}, `• This phone now: ${S.tx.length} purchases, latest ${latestDay(S.tx)}`),
+      dropped ? el("div", {}, `• ${dropped} broken purchase${dropped > 1 ? "s" : ""} in the backup will be skipped`) : null),
+    mineNewer || lost ? el("div", { class: "banner" }, `This phone has newer data. ${lost} purchase${lost === 1 ? "" : "s"} on this phone aren't in the backup and would be removed.`) : null,
+    el("button", { class: "btn danger", onclick: () => { closeSheet(); applyBackup(st); } }, "Replace with backup"),
+    el("button", { class: "btn ghost", onclick: closeSheet }, "Cancel, keep this phone's data")));
+}
+function applySettings(next, moveMap) {
+  if (S.onboarded && !S.settings.isExample) keepUndo("settings import");
+  const old = S.onboarded && !S.settings.isExample ? S.settings.goals : null;
+  if (old) for (const g of next.goals) { const o = old.find(o => o.name === g.name); if (o && (+o.saved || 0) > (+g.saved || 0)) g.saved = o.saved; }
+  for (const [from, to] of Object.entries(moveMap || {})) {
+    const o = old.find(x => x.name === from), g = next.goals.find(x => x.name === to); if (!o || !g) continue;
+    g.saved = r2((+g.saved || 0) + (+o.saved || 0));
+    for (const t of S.tx) if (t.goal === from) t.goal = to;
+    for (const p of S.pending) if (p.goal === from) p.goal = to;
+  }
+  S.settings = next; S.onboarded = true; save(); toast("Settings imported. Your purchases stayed."); tab = "spend"; render();
+}
+function importSettings(j) {
+  const next = Object.assign(clone(EXAMPLE_SETTINGS), j.settings, { isExample: false });
+  const errs = checkSettings(next); if (errs.length) return rejectFile(errs);
+  const old = S.onboarded && !S.settings.isExample ? S.settings.goals : [];
+  const lost = old.filter(o => (+o.saved || 0) !== 0 && !next.goals.some(g => g.name === o.name));
+  if (!lost.length || j.keepGoalBalances === false) return applySettings(next, {});
+  const fresh = next.goals.filter(g => !old.some(o => o.name === g.name));
+  const sels = lost.map(o => {
+    const guess = fresh.find(g => g.name.toLowerCase().includes(o.name.toLowerCase()) || o.name.toLowerCase().includes(g.name.toLowerCase()));
+    return [o, el("select", { class: "input", "aria-label": `Where ${o.name} goes` },
+      fresh.map(g => el("option", { value: g.name, selected: guess === g }, `Move it to ${g.name}`)), el("option", { value: "", selected: !guess }, "Drop this balance"))];
+  });
+  openSheet(el("div", { class: "stack" }, el("h2", {}, "Some goals aren't in the new file"),
+    el("p", { class: "muted small", style: "margin:0" }, "Their balances would be lost. Pick where each one goes (for example, a goal that was renamed)."),
+    sels.map(([o, sel]) => el("div", { class: "field" }, el("label", {}, `${o.name} · ${money(+o.saved || 0)}`), sel)),
+    el("button", { class: "btn", onclick: () => { const map = {}; for (const [o, sel] of sels) if (sel.value) map[o.name] = sel.value; closeSheet(); applySettings(next, map); } }, "Import settings"),
+    el("button", { class: "btn ghost", onclick: closeSheet }, "Cancel")));
 }
 function importFile(f) {
   if (!f) return;
   const rd = new FileReader();
   rd.onload = () => {
+    let j; try { j = JSON.parse(rd.result); } catch (e) { return toast("That file isn't a settings or backup file from this app."); }
     try {
-      const j = JSON.parse(rd.result);
-      if (j.type === "cibi-backup" && j.state) { S = migrate(j.state); S.onboarded = true; save(); toast("Backup restored"); }
-      else if (j.type === "cibi-settings" && j.settings) {
-        const keepGoals = S.onboarded && !S.settings.isExample ? S.settings.goals : null;
-        S.settings = Object.assign(clone(EXAMPLE_SETTINGS), j.settings, { isExample: false });
-        if (keepGoals && j.keepGoalBalances !== false) for (const g of S.settings.goals) { const old = keepGoals.find(o => o.name === g.name); if (old && (+old.saved || 0) > (+g.saved || 0)) g.saved = old.saved; }
-        S.onboarded = true; save(); toast("Settings imported");
-      } else throw new Error("unknown");
-      tab = "spend"; render();
-    } catch (e) { toast("That file isn't a settings or backup file from this app."); }
+      if (j && j.type === "cibi-backup" && j.state && typeof j.state === "object") restoreBackup(j);
+      else if (j && j.type === "cibi-settings" && j.settings && typeof j.settings === "object") importSettings(j);
+      else toast("That file isn't a settings or backup file from this app.");
+    } catch (e) { toast("Couldn't read that file. Nothing was changed."); }
   };
   rd.readAsText(f);
 }
@@ -664,6 +876,10 @@ if (typeof document !== "undefined" && document.getElementById("view")) {
   $("#sheetBackdrop").addEventListener("click", closeSheet);
   const net = () => { $("#offlinePill").hidden = navigator.onLine; };
   window.addEventListener("online", net); window.addEventListener("offline", net);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && $("#sheet").hidden) render(); });
+  const refresh = () => { if (document.hidden || !$("#sheet").hidden) return; reloadIfChanged(); render(); };
+  document.addEventListener("visibilitychange", refresh);
+  window.addEventListener("focus", refresh);
+  window.addEventListener("pageshow", refresh);
+  window.addEventListener("storage", e => { if (e.key === STORE_KEY) refresh(); });
   net(); render();
 }

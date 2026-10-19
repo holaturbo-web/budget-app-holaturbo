@@ -132,3 +132,6 @@ details.more{border:1px solid var(--line);border-radius:10px;padding:10px 12px}
 details.more summary{cursor:pointer;font-size:14px;color:var(--muted);font-weight:600}
 .banner.row{display:flex;justify-content:space-between;align-items:center;gap:10px}
 @media (prefers-reduced-motion:no-preference){.bar i{transition:width .3s ease}.toast{transition:opacity .2s}}
+/* v4 */
+.bad-text{color:var(--bad)}
+.bad-text:empty{display:none}

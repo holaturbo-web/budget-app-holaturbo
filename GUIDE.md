@@ -16,6 +16,7 @@ A small personal budget app for my phone. It answers one question before I spend
 - Paycheck splitter (fixed amount to checking, the rest split across goals)
 - Goals and gift dates
 - Weekly review, backup/restore (.json) and purchase export (.csv)
+- Safety checks: it asks before a backup replaces newer data (with **Undo** in More), rejects broken settings files, and recovers from a damaged save
 
 ## Install on iPhone
 1. Open the GitHub Pages link in **Safari**
