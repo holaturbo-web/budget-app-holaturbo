@@ -1,5 +1,5 @@
 /* Offline support: cache the app shell, serve it cache-first, refresh in the background. */
-const CACHE = "cibi-v1";
+const CACHE = "cibi-v2";
 const SHELL = ["./", "index.html", "styles.css", "app.js", "manifest.webmanifest",
   "icons/icon.svg", "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];
 
