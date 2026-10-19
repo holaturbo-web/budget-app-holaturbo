@@ -117,13 +117,28 @@ function weekTotals(d = new Date()) {
 }
 
 /* ---------- Actions (used by the UI; plain functions so they can be tested) ---------- */
-function addTx({ amount, cat, note = "", day, kind = "budget", refund = false }) {
+/* Planned purchases paid from a goal take money out of that goal's balance (refunds put it back). */
+function goalEffect(t, sign) {
+  if (!t || t.kind !== "planned" || !t.goal) return;
+  const g = S.settings.goals.find(g => g.name === t.goal); if (g) g.saved = r2((+g.saved || 0) - sign * t.amount);
+}
+function addTx({ amount, cat, note = "", day, kind = "budget", refund = false, goal = "" }) {
   const t = { id: uid(), ts: tsFor(day), amount: refund ? -Math.abs(amount) : Math.abs(amount), cat, note, kind };
   if (kind === "work") t.reimbursed = false;
-  S.tx.push(t); save(); return t;
+  if (kind === "planned" && goal) t.goal = goal;
+  S.tx.push(t); goalEffect(t, 1); save(); return t;
 }
-function updateTx(id, fields) { const t = S.tx.find(x => x.id === id); if (!t) return; Object.assign(t, fields); if (t.kind === "work" && t.reimbursed == null) t.reimbursed = false; save(); }
-function deleteTx(id) { S.tx = S.tx.filter(x => x.id !== id); save(); }
+function updateTx(id, fields) {
+  const t = S.tx.find(x => x.id === id); if (!t) return;
+  goalEffect(t, -1); Object.assign(t, fields);
+  if (t.kind !== "planned") delete t.goal;
+  if (t.kind === "work" && t.reimbursed == null) t.reimbursed = false;
+  goalEffect(t, 1); save();
+}
+function deleteTx(id) { goalEffect(S.tx.find(x => x.id === id), -1); S.tx = S.tx.filter(x => x.id !== id); save(); }
+/* Everything logged with a date in the current week, all types, refunds subtracted. */
+function loggedThisWeek() { const a = weekStart().getTime(), b = addDays(weekStart(), 7).getTime(); return r2(S.tx.filter(t => t.ts >= a && t.ts < b).reduce((s, t) => s + t.amount, 0)); }
+const giftGoal = () => (S.settings.goals.find(g => /gift/i.test(g.name)) || {}).name || "";
 function coverMove(fromId, toId, amount, d = new Date()) {
   const c = catById(toId); if (!c || amount <= 0) return;
   S.moves.push({ period: periodKey(c, d), from: fromId, to: toId, amount: r2(amount), ts: Date.now() }); save();
@@ -257,7 +272,7 @@ function backupNudge() {
 }
 
 /* ---------- Spend tab ---------- */
-let draft = { cat: null, day: null, kind: "budget", refund: false };
+let draft = { cat: null, day: null, kind: "budget", refund: false, goal: "" };
 function viewSpend(v) {
   const wt = weekTotals(), days = daysLeftInWeek(), perDay = r2(wt.left / days);
   v.append(el("section", { class: "card hero" },
@@ -278,7 +293,17 @@ function viewSpend(v) {
   dateIn.addEventListener("change", () => { draft.day = dateIn.value || today; drawDays(); judge(); });
   const refundChk = el("input", { type: "checkbox", id: "refund", checked: draft.refund });
   refundChk.addEventListener("change", () => { draft.refund = refundChk.checked; judge(); });
-  const kindSeg = segmented(Object.entries(KINDS), draft.kind, k => { draft.kind = k; judge(); }, "Type");
+  const goalSel = el("select", { class: "input", id: "pgoal", "aria-label": "Paid from goal" },
+    el("option", { value: "" }, "Not from a goal"), S.settings.goals.map(g => el("option", { value: g.name, selected: g.name === draft.goal }, `From ${g.name} (${money0(+g.saved || 0)})`)));
+  goalSel.addEventListener("change", () => { draft.goal = goalSel.value; judge(); });
+  const goalRow = el("div", {}, goalSel); goalRow.hidden = draft.kind !== "planned";
+  const kindOpts = [...Object.entries(KINDS), ["gift", "Gift"]];
+  const kindSeg = segmented(kindOpts, draft.kind === "planned" && draft.goal && draft.goal === giftGoal() ? "gift" : draft.kind, k => {
+    if (k === "gift") { draft.kind = "planned"; draft.goal = giftGoal(); goalSel.value = draft.goal; if (!draft.cat) { const o = catById("other"); if (o) { draft.cat = "other"; drawChips(); } } }
+    else { draft.kind = k; if (k !== "planned") draft.goal = ""; }
+    goalRow.hidden = draft.kind !== "planned"; judge();
+  }, "Type");
+  const lateHint = el("p", { class: "muted small", style: "margin:0" });
 
   function drawChips() {
     chips.innerHTML = "";
@@ -287,11 +312,19 @@ function viewSpend(v) {
   function judge() {
     const a = parseAmt(amt.value), c = draft.cat && catById(draft.cat), d = fromIso(draft.day || today);
     logBtn.disabled = !(a && c); coverBox.innerHTML = "";
+    const now = new Date(), isWeekStartDay = now.getDay() === S.settings.weekStartDay, isNextMorning = now.getDay() === (S.settings.weekStartDay + 1) % 7 && now.getHours() < 12;
+    lateHint.textContent = draft.day === today && (isWeekStartDay || isNextMorning) ? "A new week started Friday. If you bought this before then, open Date and pick the day so it counts in last week." : "";
     logBtn.textContent = draft.refund ? "Log refund" : "Log it as spent";
     const set = (cls, head, msg) => { verdict.className = "verdict " + cls; verdict.replaceChildren(el("span", { class: "dot" }), el("div", {}, el("b", {}, head), el("p", {}, msg))); };
     if (!a || !c) return set("v-idle", !a ? "Enter an amount" : "Pick a category", !a ? "Type what it costs." : "Tap where this money comes from.");
     const per = c.period === "week" ? (isoDay(weekStart(d)) === isoDay(weekStart()) ? "this week" : "that week") : "this month", nm = c.name.toLowerCase();
-    if (draft.kind !== "budget") return set("v-ok", "Doesn't count against your week", draft.kind === "work" ? "Logged as a work purchase. It goes on your Owed to me list until you're paid back." : "Logged as planned spending paid from savings or a goal.");
+    if (draft.kind === "work") return set("v-ok", "Doesn't count against your week", "Logged as a work purchase. It goes on your Owed to me list until you're paid back.");
+    if (draft.kind === "planned") {
+      const g = S.settings.goals.find(x => x.name === draft.goal);
+      if (!g) return set("v-ok", "Doesn't count against your week", "Logged as planned spending paid from savings.");
+      const after = r2((+g.saved || 0) - (draft.refund ? -a : a));
+      return set(after < 0 ? "v-warn" : "v-ok", draft.refund ? `Refund back to ${g.name}` : `Paid from ${g.name}`, after < 0 ? `That's ${money(-after)} more than ${g.name} has. It will show as negative.` : `${g.name} goes from ${money(+g.saved || 0)} to ${money(after)}. Doesn't count against your week.`);
+    }
     if (draft.refund) return set("v-ok", "Refund", `Adds ${money(a)} back to ${nm} ${per}.`);
     const lf = left(c, d), after = r2(lf - a), lim = effLimit(c, d), used = lim > 0 ? (lim - after) / lim : 1;
     if (after < 0) {
@@ -308,9 +341,9 @@ function viewSpend(v) {
   amt.addEventListener("input", judge);
   logBtn.addEventListener("click", () => {
     const a = parseAmt(amt.value); if (!a || !draft.cat) return;
-    addTx({ amount: a, cat: draft.cat, note: note.value.trim(), day: draft.day, kind: draft.kind, refund: draft.refund });
-    toast(`${draft.refund ? "Refund" : "Logged"} ${money(a)} · ${catById(draft.cat).name}`);
-    draft = { cat: null, day: today, kind: "budget", refund: false }; render();
+    addTx({ amount: a, cat: draft.cat, note: note.value.trim(), day: draft.day, kind: draft.kind, refund: draft.refund, goal: draft.kind === "planned" ? draft.goal : "" });
+    toast(`${draft.refund ? "Refund" : "Logged"} ${money(a)} · ${catById(draft.cat).name}${draft.kind === "planned" && draft.goal ? " · from " + draft.goal : ""}`);
+    draft = { cat: null, day: today, kind: "budget", refund: false, goal: "" }; render();
   });
 
   const favs = S.settings.favorites || [];
@@ -318,17 +351,17 @@ function viewSpend(v) {
     draft.cat = f.cat; if (f.amount) amt.value = f.amount; note.value = f.label; drawChips(); judge(); if (!f.amount) amt.focus();
   } }, el("b", {}, f.label), el("span", { class: "muted" }, (catById(f.cat) || {}).name || "", f.amount ? ` · ${money0(f.amount)}` : "")))) : null;
 
-  const more = el("details", { class: "more" }, el("summary", {}, "Date, work purchase, refund"),
+  const more = el("details", { class: "more" }, el("summary", {}, "Date, gift, work purchase, refund"),
     el("div", { class: "stack", style: "margin-top:10px" },
       el("div", { class: "eyebrow" }, "When"), dayChips,
-      el("div", { class: "eyebrow" }, "Type"), kindSeg,
+      el("div", { class: "eyebrow" }, "Type"), kindSeg, goalRow,
       el("label", { class: "row small", for: "refund", style: "justify-content:flex-start" }, refundChk, "This is a refund or return")));
   if (draft.day !== today || draft.kind !== "budget" || draft.refund) more.open = true;
 
   v.append(el("section", { class: "card stack", "aria-label": "Check a purchase" },
     el("label", { for: "amt", class: "eyebrow" }, "How much?"),
     el("div", { class: "amtrow" }, el("span", {}, "$"), amt),
-    chips, favWrap ? el("div", { class: "eyebrow" }, "Favorites") : null, favWrap, note, more, verdict, coverBox, logBtn));
+    chips, favWrap ? el("div", { class: "eyebrow" }, "Favorites") : null, favWrap, note, more, lateHint, verdict, coverBox, logBtn));
   drawChips(); drawDays(); judge();
 
   const recent = S.tx.filter(t => t.ts >= weekStart().getTime()).sort((a, b) => b.ts - a.ts).slice(0, 5);
@@ -341,7 +374,7 @@ function txList(rows, emptyMsg) {
     const c = catById(t.cat) || { name: t.cat };
     const tags = [];
     if (t.kind === "work") tags.push(el("span", { class: "badge" }, t.reimbursed ? "Work · paid back" : "Work"));
-    if (t.kind === "planned") tags.push(el("span", { class: "badge" }, "Planned"));
+    if (t.kind === "planned") tags.push(el("span", { class: "badge" }, t.goal ? `From ${t.goal}` : "Planned"));
     if (t.amount < 0) tags.push(el("span", { class: "badge ok" }, "Refund"));
     return el("button", { class: "item tap", type: "button", onclick: () => editTx(t.id), "aria-label": `Edit ${t.note || c.name}` },
       el("div", { class: "what" }, el("div", {}, t.note || c.name, " ", tags), el("div", { class: "meta" }, `${c.name} · ${fmtDate(new Date(t.ts), { weekday: "short", month: "short", day: "numeric" })}`)),
@@ -356,6 +389,7 @@ function editTx(id) {
   const day = el("input", { type: "date", class: "input", value: isoDay(new Date(t.ts)), max: isoDay(new Date()), id: "eday" });
   const note = el("input", { class: "input", value: t.note || "", maxlength: "80", id: "enote" });
   const refund = el("input", { type: "checkbox", id: "erefund", checked: t.amount < 0 });
+  const egoal = el("select", { class: "input", id: "egoal" }, el("option", { value: "" }, "Not from a goal"), S.settings.goals.map(g => el("option", { value: g.name, selected: g.name === t.goal }, g.name)));
   let armed = false;
   const del = el("button", { class: "btn danger", onclick: () => { if (!armed) { armed = true; del.textContent = "Tap again to delete"; return; } deleteTx(id); closeSheet(); toast("Deleted"); render(); } }, "Delete");
   openSheet(el("div", { class: "stack" }, el("h2", {}, "Edit purchase"),
@@ -363,11 +397,12 @@ function editTx(id) {
     el("div", { class: "field" }, el("label", { for: "ecat" }, "Category"), cat),
     el("div", { class: "field" }, el("label", { for: "enote" }, "Note"), note),
     segmented(Object.entries(KINDS), kind, k => { kind = k; }, "Type"),
+    el("div", { class: "field" }, el("label", { for: "egoal" }, "Paid from goal (Planned type only)"), egoal),
     el("label", { class: "row small", for: "erefund", style: "justify-content:flex-start" }, refund, "Refund or return"),
     el("button", { class: "btn", onclick: () => {
       const a = parseAmt(amt.value); if (!a) { toast("Enter an amount"); return; }
       const sameDay = day.value === isoDay(new Date(t.ts));
-      updateTx(id, { amount: refund.checked ? -a : a, cat: cat.value, note: note.value.trim(), kind, ts: sameDay ? t.ts : tsFor(day.value) });
+      updateTx(id, { amount: refund.checked ? -a : a, cat: cat.value, note: note.value.trim(), kind, goal: kind === "planned" ? egoal.value : undefined, ts: sameDay ? t.ts : tsFor(day.value) });
       closeSheet(); toast("Saved"); render();
     } }, "Save"),
     del, el("button", { class: "btn ghost", onclick: closeSheet }, "Cancel")));
@@ -524,6 +559,7 @@ function viewMore(v) {
       top.length ? el("div", {}, `• Biggest: ${top.map(t => `${t.note || catById(t.cat)?.name} ${money0(t.amount)}`).join(", ")}.`) : null,
       S.pending.length ? el("div", {}, `• ${S.pending.length} goal move${S.pending.length > 1 ? "s" : ""} waiting on the Goals tab.`) : null,
       el("div", {}, "• Did every card purchase get logged? Compare with your Chase and Apple Card apps.")),
+    forgotCheck(),
     notes,
     el("button", { class: "btn ghost", onclick: () => { S.reviews[key] = { note: notes.value.trim(), at: Date.now() }; save(); toast("Review saved"); } }, S.reviews[key] ? "Update review" : "Mark week reviewed")));
 
@@ -542,7 +578,25 @@ function viewMore(v) {
     armed = true; reset.textContent = "Tap again to erase everything"; setTimeout(() => { armed = false; reset.textContent = "Erase all data on this phone"; }, 4000);
   } }, "Erase all data on this phone");
   v.append(el("section", { class: "card stack" }, el("h2", {}, "Reset"), reset));
-  v.append(el("p", { class: "muted small", style: "text-align:center" }, "Works offline · no account · no bank connection · v2"));
+  v.append(el("p", { class: "muted small", style: "text-align:center" }, "Works offline · no account · no bank connection · v3"));
+}
+
+/* "Forgot anything?" — compare what the card apps show with what was logged. */
+function forgotCheck() {
+  const inp = el("input", { class: "input num", inputmode: "decimal", placeholder: "Card charges since Friday, e.g. 312.40", id: "cardtot" });
+  const out = el("div", {});
+  const run = () => {
+    const card = parseAmt(inp.value), logged = loggedThisWeek(); out.innerHTML = "";
+    if (!card) return;
+    const gap = r2(card - logged);
+    if (Math.abs(gap) < 1) out.append(el("div", { class: "banner ok" }, `Everything's logged. Card ${money(card)}, app ${money(logged)}.`));
+    else if (gap > 0) out.append(el("div", { class: "banner stack" }, el("span", {}, `About ${money(gap)} isn't logged (card ${money(card)}, app ${money(logged)}). Look through your card app for what's missing.`),
+      el("button", { class: "btn sm", onclick: () => { tab = "spend"; draft.day = null; render(); setTimeout(() => { const d = document.querySelector("details.more"); if (d) d.open = true; const a = $("#amt"); if (a) a.focus(); }, 50); } }, "Log a missed purchase")));
+    else out.append(el("div", { class: "banner" }, `The app shows ${money(-gap)} more than your card (card ${money(card)}, app ${money(logged)}). Check for a duplicate or a cash purchase.`));
+  };
+  inp.addEventListener("input", run);
+  return el("div", { class: "stack" }, el("div", { class: "eyebrow" }, "Forgot anything?"),
+    el("p", { class: "muted small", style: "margin:0" }, "Add up this week's charges in your Chase and Apple Card apps and type the total."), inp, out);
 }
 
 function settingsCard() {
